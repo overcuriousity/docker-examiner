@@ -147,6 +147,9 @@ class DockerRoot:
             if cfg_path.exists():
                 try:
                     cfg = json.loads(cfg_path.read_text())
+                    hcfg_path = p / "hostconfig.json"
+                    if hcfg_path.exists():
+                        cfg["HostConfig"] = json.loads(hcfg_path.read_text())
                     run_image = cfg.get("Config", {}).get("Image", "")
                     if run_image and not run_image.startswith("sha256:"):
                         image_name = run_image
@@ -234,6 +237,53 @@ class DockerRoot:
                 img_id = full_id.removeprefix("sha256:")
                 result.setdefault(img_id, []).append(tag)
         return result
+
+    def image_pull_sources(self, image_id: str) -> list[str]:
+        """Return the registry/repository the image was pulled from.
+
+        Reads distribution v2metadata-by-diffid files, which Docker writes for
+        every layer when an image is pulled.  Each file is a JSON array of
+        {"SourceRepository": "<registry>/<repo>", "Digest": "sha256:...", ...}.
+        Falls back to repository names from repositories.json when the
+        distribution directory is absent (e.g. locally built images).
+        """
+        img_path = self.image_db / "imagedb" / "content" / "sha256" / image_id
+        try:
+            cfg = json.loads(img_path.read_text())
+        except Exception:
+            return []
+
+        diff_ids = cfg.get("rootfs", {}).get("diff_ids", [])
+        meta_dir = self.image_db / "distribution" / "v2metadata-by-diffid" / "sha256"
+        seen: dict[str, None] = {}  # ordered set
+
+        for did in diff_ids:
+            meta_file = meta_dir / did.removeprefix("sha256:")
+            if not meta_file.exists():
+                continue
+            try:
+                for entry in json.loads(meta_file.read_text()):
+                    src = entry.get("SourceRepository", "")
+                    if src:
+                        seen[src] = None
+            except Exception:
+                pass
+
+        if seen:
+            return list(seen)
+
+        # Fallback: extract repository names from repositories.json
+        repo_file = self.image_db / "repositories.json"
+        try:
+            data = json.loads(repo_file.read_text())
+        except Exception:
+            return []
+        repos: list[str] = []
+        for repo_name, tags in data.get("Repositories", {}).items():
+            for full_id in tags.values():
+                if full_id.removeprefix("sha256:") == image_id and repo_name not in repos:
+                    repos.append(repo_name)
+        return repos
 
     def layer_diff_dir(self, cache_id: str) -> Optional[Path]:
         d = self.overlay2 / cache_id / "diff"
@@ -547,9 +597,14 @@ def print_image_inspect(img: dict, docker: DockerRoot):
     cfg  = img["config"]
     ccfg = cfg.get("config", {})
     tags = img.get("tags") or docker.image_tags().get(img["id"], [])
+    pull_sources = docker.image_pull_sources(img["id"])
     print(f"=== Image {short(img['id'])} ===")
     print(f"  Full ID   : sha256:{img['id']}")
     print(f"  Tags      : {', '.join(tags) if tags else '(untagged)'}")
+    if pull_sources:
+        print(f"  Pull origin: {pull_sources[0]}")
+        for src in pull_sources[1:]:
+            print(f"               {src}")
     print(f"  Created   : {fmt_ts(cfg.get('created', ''))}")
     print(f"  OS/Arch   : {cfg.get('os', '?')}/{cfg.get('architecture', '?')}")
     print(f"  Docker ver: {cfg.get('docker_version', '?')}")
@@ -613,6 +668,12 @@ def print_container_inspect(c: dict, docker: DockerRoot):
         print(f"  Image     : {image_name}  ({image_id})")
     else:
         print(f"  Image     : {image_name or image_id}")
+    raw_image_id = cfg.get("Image", "").removeprefix("sha256:")
+    pull_sources = docker.image_pull_sources(raw_image_id) if raw_image_id else []
+    if pull_sources:
+        print(f"  Pull origin: {pull_sources[0]}")
+        for src in pull_sources[1:]:
+            print(f"               {src}")
     print(f"  Created   : {fmt_ts(cfg.get('Created', ''))}")
 
     print(f"\n  State:")
@@ -678,6 +739,12 @@ def print_container_inspect(c: dict, docker: DockerRoot):
     restart = hcfg.get("RestartPolicy", {})
     if restart:
         print(f"\n  Restart policy: {restart.get('Name', '?')}  (MaxRetry={restart.get('MaximumRetryCount', 0)})")
+
+    log_cfg = hcfg.get("LogConfig", {}) or {}
+    if log_cfg.get("Type"):
+        print(f"\n  Log driver: {log_cfg['Type']}")
+        for k, v in (log_cfg.get("Config") or {}).items():
+            print(f"    {k}: {v}")
 
     labels = ccfg.get("Labels", {}) or {}
     if labels:
@@ -765,6 +832,7 @@ def _image_to_dict(img: dict, docker: DockerRoot) -> dict:
         "id": "sha256:" + img["id"],
         "short_id": short(img["id"]),
         "tags": tags,
+        "pull_sources": docker.image_pull_sources(img["id"]),
         "created": cfg.get("created", ""),
         "os": cfg.get("os", ""),
         "architecture": cfg.get("architecture", ""),
@@ -824,6 +892,9 @@ def _container_to_dict(c: dict, docker: DockerRoot) -> dict:
         "name": cfg.get("Name", "").lstrip("/"),
         "image": c.get("image_name", ""),
         "image_id": cfg.get("Image", ""),
+        "image_pull_sources": docker.image_pull_sources(
+            cfg.get("Image", "").removeprefix("sha256:")
+        ),
         "created": cfg.get("Created", ""),
         "state": {
             "status": st.get("Status", ""),
@@ -1014,8 +1085,12 @@ class ReportBuilder:
             self.docker.overlay2,
             self.docker.image_db / "imagedb",
             self.docker.image_db / "layerdb",
+            self.docker.image_db / "distribution",
             self.docker.image_db / "repositories.json",
             self.docker.containers,
+            self.docker.root / "volumes",
+            self.docker.root / "network",
+            self.docker.root / "plugins",
         ]
         for cp in checks:
             rel = cp.relative_to(self.docker.root) if cp.is_relative_to(self.docker.root) else cp
@@ -1037,22 +1112,91 @@ class ReportBuilder:
                 w(f"| `{rel}` | yes | {n} entries | — | — |\n")
         w("\n")
 
-        # ── 4. Image inventory ────────────────────────────────────────────────
-        self._progress("Collecting images…")
-        images = self.docker.images()
+        # ── 4. Summary ────────────────────────────────────────────────────────
+        self._progress("Building summary…")
+        images     = self.docker.images()
+        containers = self.docker.containers_list()
+
+        w("## Summary\n\n")
+        w(f"| Item | Count |\n|---|---|\n")
+        w(f"| Images | {len(images)} |\n")
+        w(f"| Containers (total) | {len(containers)} |\n")
+        running  = [c for c in containers if c["config"].get("State", {}).get("Running")]
+        stopped  = [c for c in containers if not c["config"].get("State", {}).get("Running")]
+        oom      = [c for c in containers if c["config"].get("State", {}).get("OOMKilled")]
+        nonzero  = [c for c in containers
+                    if not c["config"].get("State", {}).get("Running")
+                    and c["config"].get("State", {}).get("ExitCode", 0) != 0]
+        privileged_ctrs = [c for c in containers
+                           if (c["config"].get("HostConfig") or {}).get("Privileged")]
+        w(f"| Containers (running) | {len(running)} |\n")
+        w(f"| Containers (stopped) | {len(stopped)} |\n")
+        w(f"| Containers (OOM killed) | {len(oom)} |\n")
+        w(f"| Containers (non-zero exit) | {len(nonzero)} |\n")
+        w(f"| Containers (privileged) | {len(privileged_ctrs)} |\n")
+
+        missing_layers: list[str] = []
+        for img in images:
+            try:
+                diff_ids  = img["config"].get("rootfs", {}).get("diff_ids", [])
+                cache_ids = self.docker.image_cache_ids(img["id"])
+                for cid in cache_ids:
+                    if cid is None or not (self.docker.overlay2 / cid / "diff").exists():
+                        missing_layers.append(short(img["id"]))
+                        break
+            except Exception:
+                pass
+        w(f"| Images with missing layers | {len(missing_layers)} |\n")
+        w("\n")
+
+        if nonzero:
+            w("**Containers with non-zero exit codes:**\n\n")
+            w("| Short ID | Name | Image | Exit Code | Finished |\n|---|---|---|---|---|\n")
+            for c in nonzero:
+                cfg = c["config"]
+                st  = cfg.get("State", {})
+                fin = st.get("FinishedAt", "")
+                if fin == "0001-01-01T00:00:00Z":
+                    fin = ""
+                w(f"| `{short(c['id'])}` | {cfg.get('Name','').lstrip('/')} "
+                  f"| {c.get('image_name','')} | {st.get('ExitCode','?')} | `{fin}` |\n")
+            w("\n")
+
+        if oom:
+            w("**OOM-killed containers:**\n\n")
+            for c in oom:
+                w(f"- `{short(c['id'])}` {c['config'].get('Name','').lstrip('/')}\n")
+            w("\n")
+
+        if privileged_ctrs:
+            w("**Privileged containers:**\n\n")
+            for c in privileged_ctrs:
+                w(f"- `{short(c['id'])}` {c['config'].get('Name','').lstrip('/')}"
+                  f" ({c.get('image_name','')})\n")
+            w("\n")
+
+        if missing_layers:
+            w("**Images with missing layers:**\n\n")
+            for sid in missing_layers:
+                w(f"- `{sid}`\n")
+            w("\n")
+
+        # ── 5. Image inventory ────────────────────────────────────────────────
         w(f"## Images ({len(images)})\n\n")
         if images:
-            w("| Short ID | Tags | Created | OS/Arch | Docker Ver | Layers | Size | Config SHA-256 |\n")
+            w("| Short ID | Tags | Pull Origin | Created | OS/Arch | Layers | Size | Config SHA-256 |\n")
             w("|---|---|---|---|---|---|---|---|\n")
             for img in images:
                 cfg   = img["config"]
                 sid   = short(img["id"])
                 tags  = ", ".join(img.get("tags", [])) or "(untagged)"
+                pull  = (self.docker.image_pull_sources(img["id"]) or [""])[0]
                 ctime = cfg.get("created", "")
+                variant = cfg.get("variant", "")
                 osarch = f"{cfg.get('os','?')}/{cfg.get('architecture','?')}"
-                dver  = cfg.get("docker_version", "?")
+                if variant:
+                    osarch += f"/{variant}"
                 nlyr  = len(cfg.get("rootfs", {}).get("diff_ids", []))
-                # total size of all layers
                 try:
                     cids = self.docker.image_cache_ids(img["id"])
                     total_size = sum(
@@ -1061,10 +1205,9 @@ class ReportBuilder:
                     )
                 except Exception:
                     total_size = 0
-                # config file hash
                 cfg_path = (self.docker.image_db / "imagedb" / "content" / "sha256" / img["id"])
                 cfg_sha  = _file_sha256(cfg_path) if cfg_path.exists() else ""
-                w(f"| `{sid}` | {tags} | `{ctime}` | {osarch} | {dver} | {nlyr}"
+                w(f"| `{sid}` | {tags} | {pull} | `{ctime}` | {osarch} | {nlyr}"
                   f" | {fmt_size(total_size)} | `{cfg_sha[:16]}…` |\n")
             w("\n")
 
@@ -1074,26 +1217,29 @@ class ReportBuilder:
         else:
             w("_(no images found)_\n\n")
 
-        # ── 5. Container inventory ────────────────────────────────────────────
-        self._progress("Collecting containers…")
-        containers = self.docker.containers_list()
+        # ── 6. Container inventory ────────────────────────────────────────────
         w(f"## Containers ({len(containers)})\n\n")
         if containers:
-            w("| Short ID | Name | Image | State | Created | Started | Finished |\n")
-            w("|---|---|---|---|---|---|---|\n")
+            w("| Short ID | Name | Image | State | Exit | OOM | Privileged | Created | Started | Finished |\n")
+            w("|---|---|---|---|---|---|---|---|---|---|\n")
             for c in containers:
                 cfg  = c["config"]
                 st   = cfg.get("State", {})
+                hcfg = cfg.get("HostConfig") or {}
                 sid  = short(c["id"])
                 name = cfg.get("Name", "").lstrip("/") or "(unnamed)"
                 img  = c.get("image_name") or short(cfg.get("Image", "").removeprefix("sha256:"), 12)
                 state = st.get("Status", "?")
+                exit_code = st.get("ExitCode", "?")
+                oom_flag  = "YES" if st.get("OOMKilled") else "no"
+                priv_flag = "YES" if hcfg.get("Privileged") else "no"
                 ctime = cfg.get("Created", "")
                 start = st.get("StartedAt", "")
                 fin   = st.get("FinishedAt", "")
                 if fin == "0001-01-01T00:00:00Z":
                     fin = ""
-                w(f"| `{sid}` | {name} | {img} | {state} | `{ctime}` | `{start}` | `{fin}` |\n")
+                w(f"| `{sid}` | {name} | {img} | {state} | {exit_code} | {oom_flag}"
+                  f" | {priv_flag} | `{ctime}` | `{start}` | `{fin}` |\n")
             w("\n")
 
             for c in containers:
@@ -1102,7 +1248,7 @@ class ReportBuilder:
         else:
             w("_(no containers found)_\n\n")
 
-        # ── 6. Warnings ───────────────────────────────────────────────────────
+        # ── 7. Warnings ───────────────────────────────────────────────────────
         all_warnings = self.docker.warnings[:]
         w("## Warnings\n\n")
         if all_warnings:
@@ -1122,11 +1268,46 @@ class ReportBuilder:
     def _write_image_detail(self, buf: io.StringIO, img: dict):
         w = buf.write
         cfg  = img["config"]
+        ccfg = cfg.get("config", {}) or {}
         sid  = short(img["id"])
         tags = ", ".join(img.get("tags", [])) or "(untagged)"
         w(f"### Image `{sid}` — {tags}\n\n")
         w(f"- Full ID: `sha256:{img['id']}`\n")
         w(f"- Created: `{cfg.get('created', '')}`\n")
+        variant = cfg.get("variant", "")
+        osarch = f"{cfg.get('os', '?')}/{cfg.get('architecture', '?')}"
+        if variant:
+            osarch += f"/{variant}"
+        w(f"- OS/Arch: {osarch}\n")
+        if cfg.get("docker_version"):
+            w(f"- Docker version: {cfg['docker_version']}\n")
+        pull_sources = self.docker.image_pull_sources(img["id"])
+        if pull_sources:
+            w(f"- Pull origin: {', '.join(f'`{s}`' for s in pull_sources)}\n")
+
+        ep  = ccfg.get("Entrypoint") or cfg.get("Entrypoint") or []
+        cmd = ccfg.get("Cmd") or cfg.get("Cmd") or []
+        if ep:
+            w(f"- Entrypoint: `{ep}`\n")
+        if cmd:
+            w(f"- Cmd: `{cmd}`\n")
+
+        exposed = ccfg.get("ExposedPorts", {}) or {}
+        if exposed:
+            w(f"- Exposed ports: {', '.join(exposed.keys())}\n")
+
+        env = ccfg.get("Env", []) or []
+        if env:
+            w(f"\n**Environment ({len(env)} vars):**\n\n")
+            for e in env:
+                w(f"    {e}  \n")
+
+        labels = ccfg.get("Labels", {}) or {}
+        if labels:
+            w(f"\n**Labels ({len(labels)}):**\n\n")
+            for k, v in labels.items():
+                w(f"- `{k}` = `{v}`\n")
+
         history = cfg.get("history", [])
         if history:
             w(f"\n**Build history ({len(history)} steps):**\n\n")
@@ -1134,8 +1315,9 @@ class ReportBuilder:
                 cb = h.get("created_by", "")[:100]
                 empty = " _(empty layer)_" if h.get("empty_layer") else ""
                 w(f"  {i}. `{cb}`{empty}\n")
+
         w("\n**Layers:**\n\n")
-        w("| # | Diff ID (short) | Cache ID | On disk | Size |")
+        w("| # | Diff ID (sha256) | Cache ID | On disk | Size |")
         if self.hash_layers:
             w(" Tree SHA-256 |")
         w("\n|---|---|---|---|---|")
@@ -1149,12 +1331,10 @@ class ReportBuilder:
                 diff_dir = self.docker.overlay2 / cid / "diff" if cid else None
                 on_disk  = bool(diff_dir and diff_dir.exists())
                 size     = fmt_size(_dir_size(diff_dir)) if on_disk and diff_dir else "—"
-                did_s    = short(did.removeprefix("sha256:"), 16)
-                cid_s    = short(cid or "?", 16)
-                w(f"| {i} | `{did_s}` | `{cid_s}` | {'yes' if on_disk else 'NO'} | {size} |")
+                w(f"| {i} | `{did}` | `{cid or '(missing)'}` | {'yes' if on_disk else 'NO'} | {size} |")
                 if self.hash_layers:
                     tree_h = _tree_sha256(diff_dir) if on_disk and diff_dir else "—"
-                    w(f" `{tree_h[:16]}…` |")
+                    w(f" `{tree_h}` |")
                 w("\n")
         except Exception as exc:
             msg = f"[!] layer detail failed for {sid}: {exc}"
@@ -1165,27 +1345,262 @@ class ReportBuilder:
     def _write_container_detail(self, buf: io.StringIO, c: dict):
         w = buf.write
         cfg  = c["config"]
-        st   = cfg.get("State", {})
+        ccfg = cfg.get("Config", {}) or {}
+        st   = cfg.get("State", {}) or {}
         hcfg = cfg.get("HostConfig") or {}
+        net  = cfg.get("NetworkSettings", {}) or {}
         sid  = short(c["id"])
         name = cfg.get("Name", "").lstrip("/") or "(unnamed)"
         w(f"### Container `{sid}` — {name}\n\n")
-        w(f"- Full ID: `{c['id']}`\n")
-        w(f"- Image: {c.get('image_name') or cfg.get('Image', '')}\n")
-        w(f"- State: {st.get('Status', '?')} (exit code {st.get('ExitCode', '?')})\n")
 
-        # config file hash
+        # ── Identity ──────────────────────────────────────────────────────────
+        w(f"**Identity**\n\n")
+        w(f"| Field | Value |\n|---|---|\n")
+        w(f"| Full ID | `{c['id']}` |\n")
+        w(f"| Image | {c.get('image_name') or cfg.get('Image', '')} |\n")
+        raw_image_id = cfg.get("Image", "").removeprefix("sha256:")
+        pull_sources = self.docker.image_pull_sources(raw_image_id) if raw_image_id else []
+        if pull_sources:
+            w(f"| Pull origin | {' / '.join(pull_sources)} |\n")
+        w(f"| Created | `{cfg.get('Created', '')}` |\n")
         cfg_path = self.docker.containers / c["id"] / "config.v2.json"
         cfg_sha  = _file_sha256(cfg_path) if cfg_path.exists() else ""
         if cfg_sha:
-            w(f"- Config SHA-256: `{cfg_sha}`\n")
+            w(f"| Config SHA-256 | `{cfg_sha}` |\n")
+        w("\n")
 
-        # upper layer
+        # ── State ─────────────────────────────────────────────────────────────
+        w(f"**State**\n\n")
+        w(f"| Field | Value |\n|---|---|\n")
+        w(f"| Status | {st.get('Status', '?')} |\n")
+        w(f"| Running | {st.get('Running', False)} |\n")
+        w(f"| Paused | {st.get('Paused', False)} |\n")
+        w(f"| Restarting | {st.get('Restarting', False)} |\n")
+        w(f"| OOMKilled | {st.get('OOMKilled', False)} |\n")
+        w(f"| Dead | {st.get('Dead', False)} |\n")
+        w(f"| Exit code | {st.get('ExitCode', '?')} |\n")
+        if st.get("Error"):
+            w(f"| Error | `{st['Error']}` |\n")
+        if st.get("Pid"):
+            w(f"| PID | {st['Pid']} |\n")
+        if st.get("StartedAt"):
+            w(f"| Started | `{st['StartedAt']}` |\n")
+        finished = st.get("FinishedAt", "")
+        if finished and finished != "0001-01-01T00:00:00Z":
+            w(f"| Finished | `{finished}` |\n")
+        w("\n")
+
+        # ── Runtime config ────────────────────────────────────────────────────
+        w(f"**Runtime Configuration**\n\n")
+        w(f"| Field | Value |\n|---|---|\n")
+        if ccfg.get("Hostname"):
+            w(f"| Hostname | `{ccfg['Hostname']}` |\n")
+        if ccfg.get("Domainname"):
+            w(f"| Domainname | `{ccfg['Domainname']}` |\n")
+        if ccfg.get("User"):
+            w(f"| User | `{ccfg['User']}` |\n")
+        if ccfg.get("WorkingDir"):
+            w(f"| WorkingDir | `{ccfg['WorkingDir']}` |\n")
+        if ccfg.get("StopSignal"):
+            w(f"| StopSignal | `{ccfg['StopSignal']}` |\n")
+        ep  = ccfg.get("Entrypoint") or []
+        cmd = ccfg.get("Cmd") or []
+        if ep:
+            w(f"| Entrypoint | `{ep}` |\n")
+        if cmd:
+            w(f"| Cmd | `{cmd}` |\n")
+        exposed = ccfg.get("ExposedPorts", {}) or {}
+        if exposed:
+            w(f"| Exposed ports | {', '.join(exposed.keys())} |\n")
+        w("\n")
+
+        # ── Security ──────────────────────────────────────────────────────────
+        w(f"**Security**\n\n")
+        w(f"| Field | Value |\n|---|---|\n")
+        w(f"| Privileged | {hcfg.get('Privileged', False)} |\n")
+        w(f"| ReadonlyRootfs | {hcfg.get('ReadonlyRootfs', False)} |\n")
+        cap_add  = hcfg.get("CapAdd") or []
+        cap_drop = hcfg.get("CapDrop") or []
+        if cap_add:
+            w(f"| CapAdd | `{cap_add}` |\n")
+        if cap_drop:
+            w(f"| CapDrop | `{cap_drop}` |\n")
+        sec_opts = hcfg.get("SecurityOpt") or []
+        if sec_opts:
+            w(f"| SecurityOpt | {', '.join(f'`{o}`' for o in sec_opts)} |\n")
+        w("\n")
+
+        # ── Isolation / namespaces ────────────────────────────────────────────
+        net_mode = hcfg.get("NetworkMode", "")
+        pid_mode = hcfg.get("PidMode", "")
+        ipc_mode = hcfg.get("IpcMode", "")
+        uts_mode = hcfg.get("UTSMode", "")
+        if any([net_mode, pid_mode, ipc_mode, uts_mode]):
+            w(f"**Isolation / Namespaces**\n\n")
+            w(f"| Field | Value |\n|---|---|\n")
+            if net_mode:
+                w(f"| NetworkMode | `{net_mode}` |\n")
+            if pid_mode:
+                w(f"| PidMode | `{pid_mode}` |\n")
+            if ipc_mode:
+                w(f"| IpcMode | `{ipc_mode}` |\n")
+            if uts_mode:
+                w(f"| UTSMode | `{uts_mode}` |\n")
+            w("\n")
+
+        # ── Resource limits ───────────────────────────────────────────────────
+        res = hcfg.get("Resources") or hcfg  # older Docker stores limits directly in HostConfig
+        memory     = res.get("Memory", 0)
+        mem_swap   = res.get("MemorySwap", 0)
+        nano_cpus  = res.get("NanoCPUs", 0)
+        cpu_shares = res.get("CpuShares", 0)
+        cpuset     = res.get("CpusetCpus", "")
+        shm_size   = hcfg.get("ShmSize", 0)
+        ulimits    = hcfg.get("Ulimits") or []
+        devices    = hcfg.get("Devices") or []
+        if any([memory, mem_swap, nano_cpus, cpu_shares, cpuset, shm_size, ulimits, devices]):
+            w(f"**Resource Limits**\n\n")
+            w(f"| Resource | Value |\n|---|---|\n")
+            if memory:
+                w(f"| Memory | {fmt_size(memory)} |\n")
+            if mem_swap and mem_swap != -1:
+                w(f"| MemorySwap | {fmt_size(mem_swap)} |\n")
+            elif mem_swap == -1:
+                w(f"| MemorySwap | unlimited |\n")
+            if nano_cpus:
+                w(f"| CPUs | {nano_cpus / 1e9:.2f} |\n")
+            if cpu_shares:
+                w(f"| CpuShares | {cpu_shares} |\n")
+            if cpuset:
+                w(f"| CpusetCpus | `{cpuset}` |\n")
+            if shm_size:
+                w(f"| ShmSize | {fmt_size(shm_size)} |\n")
+            if ulimits:
+                for ul in ulimits:
+                    w(f"| ulimit {ul.get('Name','')} | soft={ul.get('Soft','')} hard={ul.get('Hard','')} |\n")
+            if devices:
+                for dev in devices:
+                    w(f"| Device | `{dev.get('PathOnHost','')}` → `{dev.get('PathInContainer','')}` ({dev.get('CgroupPermissions','')}) |\n")
+            w("\n")
+
+        # ── DNS / hosts ───────────────────────────────────────────────────────
+        dns        = hcfg.get("Dns") or []
+        dns_search = hcfg.get("DnsSearch") or []
+        dns_opts   = hcfg.get("DnsOptions") or []
+        extra_hosts = hcfg.get("ExtraHosts") or []
+        if any([dns, dns_search, dns_opts, extra_hosts]):
+            w(f"**DNS / Hosts**\n\n")
+            w(f"| Field | Value |\n|---|---|\n")
+            if dns:
+                w(f"| DNS | {', '.join(f'`{d}`' for d in dns)} |\n")
+            if dns_search:
+                w(f"| DNSSearch | {', '.join(f'`{d}`' for d in dns_search)} |\n")
+            if dns_opts:
+                w(f"| DNSOptions | {', '.join(f'`{d}`' for d in dns_opts)} |\n")
+            if extra_hosts:
+                w(f"| ExtraHosts | {', '.join(f'`{h}`' for h in extra_hosts)} |\n")
+            w("\n")
+
+        # ── Environment ───────────────────────────────────────────────────────
+        env = ccfg.get("Env", []) or []
+        if env:
+            w(f"**Environment ({len(env)} vars)**\n\n")
+            w("```\n")
+            for e in env:
+                w(f"{e}\n")
+            w("```\n\n")
+
+        # ── Mounts ────────────────────────────────────────────────────────────
+        binds  = hcfg.get("Binds") or []
+        mounts = cfg.get("MountPoints", {}) or {}
+        if binds or mounts:
+            w("**Mounts**\n\n")
+            w("| Type | Container path | Source | RW |\n|---|---|---|---|\n")
+            for b in binds:
+                parts = b.split(":")
+                dst = parts[1] if len(parts) > 1 else b
+                src = parts[0]
+                rw  = "ro" if (len(parts) > 2 and "ro" in parts[2]) else "rw"
+                w(f"| bind | `{dst}` | `{src}` | {rw} |\n")
+            for dest, m in mounts.items():
+                src   = m.get("Source", "?")
+                rw    = "rw" if m.get("RW", True) else "ro"
+                mtype = m.get("Type", "mount")
+                w(f"| {mtype} | `{dest}` | `{src}` | {rw} |\n")
+            w("\n")
+
+        # ── Networks ──────────────────────────────────────────────────────────
+        nets = net.get("Networks", {}) or {}
+        if nets:
+            w("**Networks**\n\n")
+            w("| Network | IP Address | Gateway | MAC | IPv6 |\n|---|---|---|---|---|\n")
+            for netname, info in nets.items():
+                ip   = info.get("IPAddress", "")
+                gw   = info.get("Gateway", "")
+                mac  = info.get("MacAddress", "")
+                ip6  = info.get("GlobalIPv6Address", "")
+                w(f"| {netname} | {ip} | {gw} | {mac} | {ip6} |\n")
+            w("\n")
+
+        # ── Ports ─────────────────────────────────────────────────────────────
+        ports   = net.get("Ports", {}) or {}
+        exposed = ccfg.get("ExposedPorts", {}) or {}
+        if ports or exposed:
+            w("**Ports**\n\n")
+            w("| Container port | Host binding | Status |\n|---|---|---|\n")
+            published: set[str] = set()
+            for cport, bindings in ports.items():
+                if bindings:
+                    for b in bindings:
+                        host = f"{b.get('HostIp', '0.0.0.0')}:{b.get('HostPort', '?')}"
+                        w(f"| `{cport}` | `{host}` | published |\n")
+                else:
+                    w(f"| `{cport}` | — | not published |\n")
+                published.add(cport)
+            for p in exposed:
+                if p not in published:
+                    w(f"| `{p}` | — | exposed only |\n")
+            w("\n")
+
+        # ── Restart policy ────────────────────────────────────────────────────
+        restart = hcfg.get("RestartPolicy", {}) or {}
+        if restart.get("Name"):
+            w(f"**Restart policy:** `{restart['Name']}`"
+              f"  max retries: {restart.get('MaximumRetryCount', 0)}\n\n")
+
+        # ── Log driver ────────────────────────────────────────────────────────
+        log_cfg = hcfg.get("LogConfig", {}) or {}
+        if log_cfg.get("Type"):
+            w(f"**Log driver:** `{log_cfg['Type']}`")
+            opts = log_cfg.get("Config") or {}
+            if opts:
+                opts_str = "  " + ", ".join(f"`{k}={v}`" for k, v in opts.items())
+                w(opts_str)
+            w("\n\n")
+
+        # ── Labels ────────────────────────────────────────────────────────────
+        labels = ccfg.get("Labels", {}) or {}
+        if labels:
+            w(f"**Labels ({len(labels)})**\n\n")
+            w("| Key | Value |\n|---|---|\n")
+            for k, v in labels.items():
+                w(f"| `{k}` | `{v}` |\n")
+            w("\n")
+
+        # ── Overlay2 layer IDs ────────────────────────────────────────────────
         upper_id = self.docker.container_upper_id(c["id"])
+        init_id  = self.docker.container_init_id(c["id"])
+        w(f"**Overlay2 Layer IDs**\n\n")
+        w(f"| Layer | Cache ID |\n|---|---|\n")
+        w(f"| upper (writable) | `{upper_id or '(not found)'}` |\n")
+        w(f"| init | `{init_id or '(not found)'}` |\n")
+        w("\n")
+
+        # ── Filesystem diff ───────────────────────────────────────────────────
         if upper_id:
-            diff = self.docker.overlay2 / upper_id / "diff"
+            diff    = self.docker.overlay2 / upper_id / "diff"
             on_disk = diff.exists()
-            w(f"\n**Writable upper layer:** `{upper_id}`")
+            w(f"**Writable layer:** `{upper_id}`")
             if on_disk:
                 sz = fmt_size(_dir_size(diff))
                 fc = _count_files(diff)
@@ -1194,45 +1609,41 @@ class ReportBuilder:
                     w(f"  tree SHA-256: `{_tree_sha256(diff)}`")
             else:
                 w("  _(not on disk)_")
-            w("\n")
+            w("\n\n")
 
-            # diff summary
             if on_disk:
                 try:
-                    image_id = cfg.get("Image", "").removeprefix("sha256:")
+                    image_id  = cfg.get("Image", "").removeprefix("sha256:")
                     img_cache = self.docker.image_cache_ids(image_id) if image_id else []
-                    init_id   = self.docker.container_init_id(c["id"])
                     lower_ids = img_cache + ([init_id] if init_id else [])
                     img_paths = _build_path_set(self.docker, lower_ids)
                     changes   = _collect_diff(diff, img_paths)
-                    added   = sum(1 for ch in changes if ch["change"] == "A")
-                    modf    = sum(1 for ch in changes if ch["change"] == "M")
-                    deld    = sum(1 for ch in changes if ch["change"] == "D")
-                    w(f"\n**Filesystem diff:** {added} added, {modf} modified, {deld} deleted\n\n")
+                    added = sum(1 for ch in changes if ch["change"] == "A")
+                    modf  = sum(1 for ch in changes if ch["change"] == "M")
+                    deld  = sum(1 for ch in changes if ch["change"] == "D")
+                    w(f"**Filesystem diff:** {added} added, {modf} modified, {deld} deleted\n\n")
                     if changes:
                         w("| Change | Type | Path | Size | Note |\n|---|---|---|---|---|\n")
-                        for ch in changes[:200]:
+                        for ch in changes:
                             size_s = fmt_size(ch["size_bytes"]) if ch.get("size_bytes") else "—"
                             note   = ch.get("note", "")
                             w(f"| {ch['change']} | {ch['type']} | `{ch['path']}` | {size_s} | {note} |\n")
-                        if len(changes) > 200:
-                            w(f"\n_…{len(changes) - 200} more entries omitted_\n")
                         w("\n")
                 except Exception as exc:
                     msg = f"[!] diff failed for {sid}: {exc}"
                     self.docker.warnings.append(msg)
-                    w(f"\n_{msg}_\n")
+                    w(f"\n_{msg}_\n\n")
 
-        # log file
+        # ── Log file ──────────────────────────────────────────────────────────
         log_path = self.docker.container_log_path(c["id"])
         if log_path:
             log_sha  = _file_sha256(log_path)
             log_size = log_path.stat().st_size
-            w(f"\n**Log file:** `{log_path}`  \n")
-            w(f"Size: {fmt_size(log_size)}  SHA-256: `{log_sha}`  \n")
-            # count lines / errors
-            lines_ok = 0
-            errors   = 0
+            w(f"**Log file:** `{log_path}`\n\n")
+            w(f"Size: {fmt_size(log_size)}  SHA-256: `{log_sha}`\n\n")
+
+            entries: list[dict] = []
+            errors = 0
             try:
                 with open(log_path, "r", errors="replace") as fh:
                     for raw in fh:
@@ -1240,24 +1651,34 @@ class ReportBuilder:
                         if not raw:
                             continue
                         try:
-                            json.loads(raw)
-                            lines_ok += 1
+                            entries.append(json.loads(raw))
                         except json.JSONDecodeError:
                             errors += 1
-            except OSError:
-                pass
-            w(f"Lines: {lines_ok}")
+            except OSError as exc:
+                w(f"_(error reading log: {exc})_\n\n")
+                return
+
             if errors:
                 msg = f"log parse errors in {sid}: {errors} non-JSON line(s)"
                 self.docker.warnings.append(msg)
-                w(f"  _(parse errors: {errors})_")
-            w("\n\n")
-        else:
-            driver = hcfg.get("LogConfig", {}).get("Type", "")
-            if driver and driver != "json-file":
-                w(f"\n**Log:** no file found (log driver: `{driver}`)\n\n")
+                w(f"_{errors} non-JSON line(s) skipped_\n\n")
+
+            w(f"**Log entries ({len(entries)}):**\n\n")
+            if entries:
+                w("```\n")
+                for entry in entries:
+                    ts     = entry.get("time", "")[:23].replace("T", " ")
+                    stream = entry.get("stream", "?")
+                    text   = entry.get("log", "").rstrip("\n")
+                    marker = "E" if stream == "stderr" else " "
+                    w(f"{ts} {marker} {text}\n")
+                w("```\n\n")
             else:
-                w(f"\n**Log:** no file found\n\n")
+                w("_(no log entries)_\n\n")
+        else:
+            driver = (hcfg.get("LogConfig") or {}).get("Type", "")
+            note   = f" (log driver: `{driver}`)" if driver and driver != "json-file" else ""
+            w(f"**Log:** no file found{note}\n\n")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1388,6 +1809,9 @@ def cmd_diff(args, docker: DockerRoot):
 
     changes = _collect_diff(diff_dir, image_paths)
 
+    if args.filter:
+        changes = [ch for ch in changes if ch["change"] == args.filter.upper()]
+
     if args.json:
         added = sum(1 for ch in changes if ch["change"] == "A")
         modf  = sum(1 for ch in changes if ch["change"] == "M")
@@ -1398,6 +1822,7 @@ def cmd_diff(args, docker: DockerRoot):
             "image": c.get("image_name", ""),
             "image_id": "sha256:" + image_id,
             "upper_layer": upper_id,
+            "filter": args.filter or None,
             "summary": {"added": added, "modified": modf, "deleted": deld},
             "changes": changes,
         }, indent=2))
@@ -1565,6 +1990,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Show filesystem changes in a container's upper layer (A/M/D)")
     dif.add_argument("id", metavar="<id-prefix>",
                      help="Container ID prefix (images have no writable upper layer)")
+    dif.add_argument("--filter", choices=["A", "M", "D"],
+                     help="Show only Added / Modified / Deleted entries")
     dif.add_argument("--json", action="store_true", help="Output as JSON")
 
     # log

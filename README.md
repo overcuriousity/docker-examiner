@@ -6,6 +6,7 @@ Offline forensic analysis of Docker overlay2 filesystems. A single-file, zero-de
 
 - List all images and containers found in a Docker data directory
 - Inspect image and container configuration (creation time, entrypoint, env, labels, …)
+- Show pull origin — the registry and repository an image was pulled from
 - Enumerate overlay2 layers for any image or container
 - Show the diff (writes/deletes) of a container's writable layer
 - Read container stdout/stderr logs
@@ -37,7 +38,7 @@ docker-forensics <docker-root> ...
 docker_forensics.py <docker-root> list [--json]
 docker_forensics.py <docker-root> inspect (image|container) <id-prefix> [--json]
 docker_forensics.py <docker-root> layers  (image|container) <id-prefix> [--json]
-docker_forensics.py <docker-root> diff    container <id-prefix> [--json]
+docker_forensics.py <docker-root> diff    container <id-prefix> [--filter {A,M,D}] [--json]
 docker_forensics.py <docker-root> log     <id-prefix> [--json] [--stdout] [--stderr]
 docker_forensics.py <docker-root> extract (image|container) <id-prefix> <output-dir> [-v]
 docker_forensics.py <docker-root> report  [-o <path>] [--hash-layers]
@@ -51,7 +52,10 @@ ID prefixes work like Docker's own short IDs — you only need enough characters
 # List all images and containers
 python docker_forensics.py /mnt/evidence/var/lib/docker list
 
-# Inspect a container by short ID
+# Inspect an image — shows pull origin (registry/repo), layers, env, history
+python docker_forensics.py /mnt/evidence/var/lib/docker inspect image sha256abc
+
+# Inspect a container by short ID — shows pull origin of its image
 python docker_forensics.py /mnt/evidence/var/lib/docker inspect container a3f1
 
 # Show what a container wrote (upper layer diff)
@@ -77,15 +81,18 @@ python docker_forensics.py /mnt/evidence/var/lib/docker report -o report.md
 | `-o PATH` / `--output PATH` | Write to file instead of stdout. Use `-` for explicit stdout. |
 | `--hash-layers` | Compute a Merkle SHA-256 of every overlay2 `diff/` tree (slow; can read multi-GB). Off by default. |
 
+The TUI `r` key prompts for both the output path and whether to hash layers (`y/N`).
+
 The report includes:
 
 1. **Header** — tool version, UUID, generation timestamp (with explicit airgapped/non-NTP disclosure)
 2. **Examiner environment** — hostname, uid, Python version, invocation command
-3. **Evidence source** — presence, entry count, SHA-256 and mtime for key paths under the Docker root
-4. **Image inventory** — table + per-image layer detail (diff ID, cache ID, on-disk status, size, optional Merkle hash)
-5. **Container inventory** — table + per-container detail (config SHA-256, upper-layer diff summary, log file SHA-256 and line count)
-6. **Warnings** — any permission errors, missing layers, or JSON parse errors encountered
-7. **Integrity footer** — SHA-256 of the full report body; strip the footer line and re-hash with `sha256sum` to verify
+3. **Evidence source** — presence, entry count, SHA-256 and mtime for key paths (`overlay2`, `imagedb`, `layerdb`, `distribution`, `repositories.json`, `containers`, `volumes`, `network`, `plugins`)
+4. **Summary** — image and container counts; callout tables for non-zero exits, OOM kills, privileged containers, and images with missing layers
+5. **Image inventory** — summary table (with pull origin) + per-image detail: full diff IDs and cache IDs, OS/arch/variant, Docker version, pull origin, entrypoint/cmd, exposed ports, env vars, labels, build history, layer table (full sha256 diff ID, cache ID, on-disk status, size, optional full Merkle hash)
+6. **Container inventory** — summary table (with exit code, OOM, privileged columns) + per-container detail: identity (full ID, image, pull origin, created, config SHA-256), full state (running/paused/restarting/OOMKilled/dead/pid/exit code/error/started/finished), runtime config (hostname, domainname, user, workingdir, stopsignal, entrypoint/cmd), security (privileged, readonly rootfs, cap_add/drop, security opts), isolation/namespaces (network/pid/ipc/uts modes), resource limits (memory, swap, CPU, SHM, ulimits, devices), DNS/hosts config, environment variables, mounts table, networks table (IP/gateway/MAC/IPv6), ports table, restart policy, log driver, labels, overlay2 layer IDs (upper + init), full filesystem diff (A/M/D — no truncation), complete log content
+7. **Warnings** — any permission errors, missing layers, or JSON parse errors encountered
+8. **Integrity footer** — SHA-256 of the full report body; strip the footer line and re-hash with `sha256sum` to verify
 
 ## Interactive TUI
 
@@ -102,6 +109,7 @@ python docker_forensics.py /mnt/evidence/var/lib/docker --tui
 | Overview | `↑`/`↓` | Move cursor |
 | Overview | `Tab` | Switch between Images and Containers pane |
 | Overview | `Enter` | Open layer stack for selected image/container |
+| Overview | `i` | Open container config view (containers pane only) |
 | Overview | `r` | Prompt for output path and generate forensic report |
 | Overview | `q` / `Esc` | Quit |
 | Layer Stack | `↑`/`↓` | Select a layer |
@@ -109,6 +117,7 @@ python docker_forensics.py /mnt/evidence/var/lib/docker --tui
 | Layer Stack | `a` | Open action menu |
 | Layer Stack | `d` | Open diff viewer (containers only) |
 | Layer Stack | `l` | Open log viewer (containers only) |
+| Layer Stack | `i` | Open container config view (containers only) |
 | Layer Stack | `b` | Back to overview |
 | Layer Detail | `↑`/`↓` / `PgUp`/`PgDn` | Scroll |
 | Layer Detail | `a` | Open action menu |
@@ -121,6 +130,9 @@ python docker_forensics.py /mnt/evidence/var/lib/docker --tui
 | Log Viewer | `s` / `e` | Show only stdout / stderr |
 | Log Viewer | `c` | Clear filter (show all) |
 | Log Viewer | `b` | Back to layer stack |
+| Container Config | `↑`/`↓` / `PgUp`/`PgDn` | Scroll |
+| Container Config | `b` | Back to previous screen |
+| Container Config | `q` / `Esc` | Quit |
 
 ### Layer stack visualization
 

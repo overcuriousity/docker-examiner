@@ -62,13 +62,14 @@ class LayerRecord:
 # ── AppState ──────────────────────────────────────────────────────────────────
 
 class AppState(Enum):
-    OVERVIEW      = auto()
-    LAYER_STACK   = auto()
-    LAYER_DETAIL  = auto()
-    ACTION_DIALOG = auto()
-    DIFF_VIEW     = auto()
-    LOG_VIEW      = auto()
-    QUIT          = auto()
+    OVERVIEW         = auto()
+    LAYER_STACK      = auto()
+    LAYER_DETAIL     = auto()
+    ACTION_DIALOG    = auto()
+    DIFF_VIEW        = auto()
+    LOG_VIEW         = auto()
+    CONTAINER_CONFIG = auto()
+    QUIT             = auto()
 
 
 # ── Module-level helpers ─────────────────────────────────────────────────────
@@ -180,7 +181,7 @@ class OverviewScreen:
         self._draw_pane(win, 1,        img_h, self.PANE_IMG)
         self._draw_pane(win, 1 + img_h, ctr_h, self.PANE_CTR)
 
-        keys = " ↑↓ navigate   Enter: view layers   Tab: switch pane   r: report   q: quit "
+        keys = " ↑↓ navigate   Enter: view layers   i: container config   Tab: switch pane   r: report   q: quit "
         _safe(win, H - 1, 0, keys.ljust(W)[:W], curses.color_pair(CP_STATUS_BAR))
 
     def _draw_pane(self, win, y0: int, height: int, pane: int):
@@ -247,6 +248,10 @@ class OverviewScreen:
         if ch == ord('r'):
             self._run_report()
             return None
+        if ch == ord('i') and self._pane == self.PANE_CTR and self._containers:
+            self.app.selected_container = self._containers[self._ctr_cur]
+            self.app.selected_image     = None
+            return AppState.CONTAINER_CONFIG
 
         H, W = self.app.stdscr.getmaxyx()
         visible = (H - 2) // 2 - 2
@@ -296,6 +301,9 @@ class OverviewScreen:
             return
         out_path = Path(out_str.strip())
 
+        hash_str = _prompt_line(win, " Hash layers? [y/N]: ")
+        hash_layers = hash_str is not None and hash_str.strip().lower() in ("y", "yes")
+
         progress: dict = {"msg": "Starting…", "done": False, "error": None}
 
         def cb(msg: str):
@@ -303,7 +311,7 @@ class OverviewScreen:
 
         def worker():
             try:
-                report = df.ReportBuilder(self.app.docker, progress_cb=cb).build()
+                report = df.ReportBuilder(self.app.docker, hash_layers=hash_layers, progress_cb=cb).build()
                 out_path.write_text(report, encoding="utf-8")
                 progress["done"] = True
             except Exception as exc:
@@ -447,7 +455,7 @@ class LayerStackScreen:
         return "?"
 
     def _status(self, H: int, W: int):
-        extra = "   d: diff   l: log" if self.app.selected_container else ""
+        extra = "   i: config   d: diff   l: log" if self.app.selected_container else ""
         keys = f" ↑↓ select   Enter: detail   a: action{extra}   b: back   q: quit "
         _safe(self.app.stdscr, H - 1, 0, keys.ljust(W)[:W], curses.color_pair(CP_STATUS_BAR))
 
@@ -477,6 +485,8 @@ class LayerStackScreen:
             return AppState.DIFF_VIEW
         elif ch == ord('l') and self.app.selected_container:
             return AppState.LOG_VIEW
+        elif ch == ord('i') and self.app.selected_container:
+            return AppState.CONTAINER_CONFIG
         return None
 
 
@@ -505,6 +515,16 @@ class LayerDetailScreen:
         if layer.role == "image":
             n_img = sum(1 for l in self.app.layers if l.role == "image")
             row("Layer", f"{layer.index} of {n_img}")
+            img = self.app.selected_image
+            if not img and self.app.selected_container:
+                raw_id = self.app.selected_container["config"].get("Image", "").removeprefix("sha256:")
+                try:
+                    img = self.app.docker.resolve_image(raw_id) if raw_id else None
+                except Exception:
+                    img = None
+            if img:
+                for src in self.app.docker.image_pull_sources(img["id"]):
+                    row("Pull origin", src)
         row("Cache ID", layer.cache_id or "(not on disk)")
         if layer.diff_id:
             row("Diff ID", layer.diff_id)
@@ -539,7 +559,10 @@ class LayerDetailScreen:
                 else f"exited ({st.get('ExitCode', '?')})")
             env = cfg.get("Config", {}).get("Env") or []
             if env:
-                row("  Env vars", str(len(env)))
+                L.append("")
+                L.append(f"  Environment ({len(env)} vars):")
+                for e in env:
+                    L.append(f"    {e}")
 
         return L
 
@@ -1002,6 +1025,203 @@ class LogViewScreen:
         return None
 
 
+# ── ContainerConfigScreen ────────────────────────────────────────────────────
+
+class ContainerConfigScreen:
+    def __init__(self, app: TuiApp):
+        self.app = app
+        self._lines: list[str] = []
+        self._scroll = 0
+        self._back_state: AppState = AppState.OVERVIEW
+
+    def on_enter(self, back: AppState = AppState.OVERVIEW):
+        self._back_state = back
+        self._lines  = self._build()
+        self._scroll = 0
+
+    def _build(self) -> list[str]:
+        c = self.app.selected_container
+        if not c:
+            return ["  No container selected."]
+        cfg  = c["config"]
+        ccfg = cfg.get("Config", {}) or {}
+        hcfg = cfg.get("HostConfig", {}) or {}
+        st   = cfg.get("State", {}) or {}
+        net  = cfg.get("NetworkSettings", {}) or {}
+
+        sid  = df.short(c["id"])
+        name = cfg.get("Name", "").lstrip("/") or sid
+        L: list[str] = []
+
+        def section(title: str):
+            L.append("")
+            L.append(f"  ── {title} {'─' * max(0, 50 - len(title))}")
+
+        def row(k: str, v: str):
+            L.append(f"    {k:<18}: {v}")
+
+        L.append(f"  Container: {name}  ({sid})")
+        L.append(f"  Full ID  : {c['id']}")
+        row("Image", c.get("image_name", "") or cfg.get("Image", ""))
+        raw_image_id = cfg.get("Image", "").removeprefix("sha256:")
+        pull_sources = self.app.docker.image_pull_sources(raw_image_id) if raw_image_id else []
+        if pull_sources:
+            row("Pull origin", pull_sources[0])
+            for src in pull_sources[1:]:
+                row("", src)
+        row("Created", df.fmt_ts(cfg.get("Created", "")))
+        row("Status", st.get("Status", "?"))
+        row("Exit code", str(st.get("ExitCode", "?")))
+        if st.get("StartedAt"):
+            row("Started", df.fmt_ts(st["StartedAt"]))
+        if st.get("FinishedAt") and st["FinishedAt"] != "0001-01-01T00:00:00Z":
+            row("Finished", df.fmt_ts(st["FinishedAt"]))
+
+        ep  = ccfg.get("Entrypoint") or []
+        cmd = ccfg.get("Cmd") or []
+        if ep or cmd:
+            section("Command")
+            if ep:
+                row("Entrypoint", str(ep))
+            if cmd:
+                row("Cmd", str(cmd))
+
+        env = ccfg.get("Env") or []
+        if env:
+            section(f"Environment ({len(env)} vars)")
+            for e in env:
+                L.append(f"    {e}")
+
+        binds = hcfg.get("Binds") or []
+        mounts = cfg.get("MountPoints", {}) or {}
+        if binds or mounts:
+            section("Mounts / Volume Binds")
+            for b in binds:
+                L.append(f"    bind  {b}")
+            for dest, m in mounts.items():
+                src = m.get("Source", "?")
+                rw  = "rw" if m.get("RW", True) else "ro"
+                mtype = m.get("Type", "")
+                L.append(f"    {mtype or 'mount'}  {dest}  ←  {src}  ({rw})")
+
+        ports = net.get("Ports", {})
+        exposed = ccfg.get("ExposedPorts", {}) or {}
+        if ports or exposed:
+            section("Ports")
+            published = set()
+            for cport, bindings in (ports or {}).items():
+                if bindings:
+                    for b in bindings:
+                        host = f"{b.get('HostIp', '0.0.0.0')}:{b.get('HostPort', '?')}"
+                        L.append(f"    {cport}  →  {host}")
+                        published.add(cport)
+                else:
+                    L.append(f"    {cport}  (not published)")
+                    published.add(cport)
+            for p in exposed:
+                if p not in published:
+                    L.append(f"    {p}  (exposed, not published)")
+
+        nets = net.get("Networks", {}) or {}
+        if nets:
+            section("Networks")
+            for netname, info in nets.items():
+                ip  = info.get("IPAddress", "?")
+                gw  = info.get("Gateway", "?")
+                mac = info.get("MacAddress", "?")
+                L.append(f"    {netname:<20}  IP={ip}  GW={gw}  MAC={mac}")
+
+        sec_flags = []
+        if hcfg.get("Privileged"):
+            sec_flags.append("privileged")
+        caps_add = hcfg.get("CapAdd") or []
+        if caps_add:
+            sec_flags.append(f"cap_add={caps_add}")
+        caps_drop = hcfg.get("CapDrop") or []
+        if caps_drop:
+            sec_flags.append(f"cap_drop={caps_drop}")
+        sec_opt = hcfg.get("SecurityOpt") or []
+        if sec_opt:
+            sec_flags.append(f"security_opt={sec_opt}")
+        net_mode = hcfg.get("NetworkMode", "")
+        pid_mode = hcfg.get("PidMode", "")
+        userns   = hcfg.get("UsernsMode", "")
+        if sec_flags or net_mode or pid_mode or userns:
+            section("Host Config / Security")
+            if net_mode:
+                row("NetworkMode", net_mode)
+            if pid_mode:
+                row("PidMode", pid_mode)
+            if userns:
+                row("UsernsMode", userns)
+            for f in sec_flags:
+                L.append(f"    {f}")
+
+        restart = hcfg.get("RestartPolicy", {}) or {}
+        if restart.get("Name"):
+            section("Restart Policy")
+            row("Policy", restart.get("Name", "?"))
+            row("Max retries", str(restart.get("MaximumRetryCount", 0)))
+
+        log_cfg = hcfg.get("LogConfig", {}) or {}
+        if log_cfg.get("Type"):
+            section("Log Driver")
+            row("Driver", log_cfg.get("Type", "?"))
+            opts = log_cfg.get("Config") or {}
+            for k, v in opts.items():
+                row(f"  {k}", str(v))
+
+        labels = ccfg.get("Labels", {}) or {}
+        if labels:
+            section(f"Labels ({len(labels)})")
+            for k, v in labels.items():
+                L.append(f"    {k} = {v}")
+
+        return L
+
+    def draw(self):
+        win = self.app.stdscr
+        H, W = win.getmaxyx()
+        c = self.app.selected_container
+        name = c["config"].get("Name", "").lstrip("/") if c else "?"
+        _safe(win, 0, 0, f" Container Config: {name} ".ljust(W)[:W],
+              curses.color_pair(CP_HEADER))
+
+        visible = H - 2
+        for i, line in enumerate(self._lines[self._scroll:self._scroll + visible]):
+            _safe(win, 1 + i, 0, line[:W])
+
+        max_scroll = max(0, len(self._lines) - visible)
+        if self._scroll < max_scroll:
+            _safe(win, H - 2, 0, "  [↓ more below]", curses.A_DIM)
+
+        keys = " ↑↓/PgUp/PgDn scroll   b: back   q: quit "
+        _safe(win, H - 1, 0, keys.ljust(W)[:W], curses.color_pair(CP_STATUS_BAR))
+
+    def handle_key(self, ch: int) -> Optional[AppState]:
+        if ch == curses.KEY_RESIZE:
+            curses.update_lines_cols()
+            return None
+        if ch in (ord('q'), 27):
+            return AppState.QUIT
+        if ch == ord('b'):
+            return self._back_state
+
+        H, _ = self.app.stdscr.getmaxyx()
+        visible    = H - 2
+        max_scroll = max(0, len(self._lines) - visible)
+
+        if ch == curses.KEY_UP:
+            self._scroll = max(0, self._scroll - 1)
+        elif ch == curses.KEY_DOWN:
+            self._scroll = min(max_scroll, self._scroll + 1)
+        elif ch == curses.KEY_PPAGE:
+            self._scroll = max(0, self._scroll - visible)
+        elif ch == curses.KEY_NPAGE:
+            self._scroll = min(max_scroll, self._scroll + visible)
+        return None
+
+
 # ── TuiApp ────────────────────────────────────────────────────────────────────
 
 class TuiApp:
@@ -1020,20 +1240,22 @@ class TuiApp:
         stdscr.keypad(True)
         self._init_colors()
 
-        overview = OverviewScreen(self)
-        stk      = LayerStackScreen(self)
-        det      = LayerDetailScreen(self)
-        dlg      = ActionDialog(self)
-        diffview = DiffViewScreen(self)
-        logview  = LogViewScreen(self)
+        overview  = OverviewScreen(self)
+        stk       = LayerStackScreen(self)
+        det       = LayerDetailScreen(self)
+        dlg       = ActionDialog(self)
+        diffview  = DiffViewScreen(self)
+        logview   = LogViewScreen(self)
+        cfgview   = ContainerConfigScreen(self)
 
         screens = {
-            AppState.OVERVIEW:      overview,
-            AppState.LAYER_STACK:   stk,
-            AppState.LAYER_DETAIL:  det,
-            AppState.ACTION_DIALOG: dlg,
-            AppState.DIFF_VIEW:     diffview,
-            AppState.LOG_VIEW:      logview,
+            AppState.OVERVIEW:         overview,
+            AppState.LAYER_STACK:      stk,
+            AppState.LAYER_DETAIL:     det,
+            AppState.ACTION_DIALOG:    dlg,
+            AppState.DIFF_VIEW:        diffview,
+            AppState.LOG_VIEW:         logview,
+            AppState.CONTAINER_CONFIG: cfgview,
         }
 
         state = AppState.OVERVIEW
@@ -1075,8 +1297,12 @@ class TuiApp:
                 if next_state == AppState.ACTION_DIALOG:
                     dlg.parent_screen = screens[state]
                 self.status_msg = ""
+                prev_state = state
                 state = next_state
-                screens[state].on_enter()
+                if state == AppState.CONTAINER_CONFIG:
+                    cfgview.on_enter(back=prev_state)
+                else:
+                    screens[state].on_enter()
 
     def _init_colors(self):
         curses.start_color()
