@@ -17,13 +17,18 @@ e.g. /mnt/evidence/var/lib/docker  or  /cases/001/docker
 """
 
 import argparse
+import getpass
 import hashlib
+import io
 import json
 import os
+import platform
 import shutil
+import socket
 import stat
 import sys
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -36,11 +41,11 @@ def short(sha: str, n: int = 12) -> str:
 
 
 def fmt_size(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
+    for unit in ("B", "KiB", "MiB", "GiB"):
         if n < 1024:
             return f"{n:.1f} {unit}"
         n /= 1024
-    return f"{n:.1f} TB"
+    return f"{n:.1f} TiB"
 
 
 def fmt_ts(ts: str) -> str:
@@ -48,7 +53,7 @@ def fmt_ts(ts: str) -> str:
     if not ts:
         return "(unknown)"
     try:
-        dt = datetime.fromisoformat(ts.rstrip("Z").split(".")[0])
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
     except ValueError:
         return ts
@@ -91,22 +96,30 @@ class DockerRoot:
         self.overlay2    = self.root / "overlay2"
         self.image_db    = self.root / "image" / "overlay2"
         self.containers  = self.root / "containers"
+        self.warnings: list[str] = []
 
     # ── Image enumeration ────────────────────────────────────────────────────
 
     def images(self) -> list[dict]:
         img_dir = self.image_db / "imagedb" / "content" / "sha256"
-        if not img_dir.exists():
+        try:
+            entries = sorted(img_dir.iterdir())
+        except PermissionError:
+            print(f"[!] Permission denied: {img_dir} — re-run as root / with sudo", file=sys.stderr)
+            return []
+        except FileNotFoundError:
             return []
         tags_map = self.image_tags()
         result = []
-        for p in sorted(img_dir.iterdir()):
+        for p in entries:
             try:
                 cfg = json.loads(p.read_text())
                 result.append({"id": p.name, "config": cfg,
                                 "tags": tags_map.get(p.name, [])})
-            except Exception:
-                pass
+            except Exception as exc:
+                msg = f"[!] skipped image {p.name[:12]}: {exc}"
+                print(msg, file=sys.stderr)
+                self.warnings.append(msg)
         return result
 
     def resolve_image(self, prefix: str) -> dict:
@@ -120,11 +133,16 @@ class DockerRoot:
     # ── Container enumeration ────────────────────────────────────────────────
 
     def containers_list(self) -> list[dict]:
-        if not self.containers.exists():
+        try:
+            entries = sorted(self.containers.iterdir())
+        except PermissionError:
+            print(f"[!] Permission denied: {self.containers} — re-run as root / with sudo", file=sys.stderr)
+            return []
+        except FileNotFoundError:
             return []
         tags_map = self.image_tags()
         result = []
-        for p in sorted(self.containers.iterdir()):
+        for p in entries:
             cfg_path = p / "config.v2.json"
             if cfg_path.exists():
                 try:
@@ -137,8 +155,10 @@ class DockerRoot:
                         names  = tags_map.get(img_id, [])
                         image_name = names[0] if names else ""
                     result.append({"id": p.name, "config": cfg, "image_name": image_name})
-                except Exception:
-                    pass
+                except Exception as exc:
+                    msg = f"[!] skipped container {p.name[:12]}: {exc}"
+                    print(msg, file=sys.stderr)
+                    self.warnings.append(msg)
         return result
 
     def resolve_container(self, prefix: str) -> dict:
@@ -881,6 +901,365 @@ def _copy_xattrs(src: Path, dst: Path) -> None:
             pass
 
 
+def _file_sha256(path: Path) -> str:
+    """Return the SHA-256 hex digest of a file's content, or '' on error."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def _tree_sha256(path: Path) -> str:
+    """Deterministic Merkle-style SHA-256 of a directory tree.
+
+    Walk order is lexicographic. Each entry contributes one line to the outer
+    hash: ``f <rel>\0<content-sha256>\n`` for regular files,
+    ``l <rel>\0<link-target>\n`` for symlinks, ``d <rel>\n`` for directories.
+    """
+    outer = hashlib.sha256()
+    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+        dirnames.sort()
+        rel = Path(dirpath).relative_to(path)
+        if str(rel) != ".":
+            outer.update(f"d {rel}\n".encode())
+        for fname in sorted(filenames):
+            fpath = Path(dirpath) / fname
+            rel_file = rel / fname
+            try:
+                if fpath.is_symlink():
+                    target = os.readlink(fpath)
+                    outer.update(f"l {rel_file}\0{target}\n".encode())
+                else:
+                    inner = hashlib.sha256()
+                    with open(fpath, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(65536), b""):
+                            inner.update(chunk)
+                    outer.update(f"f {rel_file}\0{inner.hexdigest()}\n".encode())
+            except OSError:
+                pass
+    return outer.hexdigest()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Forensic report builder
+# ──────────────────────────────────────────────────────────────────────────────
+
+_TOOL_VERSION = "0.1.0"
+
+
+def _tool_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("docker-forensics")
+    except Exception:
+        return _TOOL_VERSION
+
+
+class ReportBuilder:
+    """Build a self-contained Markdown forensic report from a DockerRoot."""
+
+    def __init__(self, docker: DockerRoot, hash_layers: bool = False,
+                 progress_cb=None):
+        self.docker = docker
+        self.hash_layers = hash_layers
+        self._progress = progress_cb or (lambda _msg: None)
+
+    def build(self) -> str:
+        buf = io.StringIO()
+        w = buf.write
+
+        now_utc = datetime.now(timezone.utc)
+        ts_str   = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        report_id = str(uuid.uuid4())
+        ver = _tool_version()
+
+        # ── 1. Header ─────────────────────────────────────────────────────────
+        w("# Docker Forensic Report\n\n")
+        w(f"| Field | Value |\n|---|---|\n")
+        w(f"| Tool | docker-forensics {ver} |\n")
+        w(f"| Report ID | `{report_id}` |\n")
+        w(f"| Generated | `{ts_str}` |\n")
+        w(f"| Clock note | Local system clock — not NTP-verified (airgapped) |\n")
+        w(f"| Evidence root | `{self.docker.root.resolve()}` |\n\n")
+
+        # ── 2. Environment ────────────────────────────────────────────────────
+        w("## Examiner Environment\n\n")
+        try:
+            hostname = socket.gethostname()
+        except Exception:
+            hostname = "(unknown)"
+        try:
+            username = getpass.getuser()
+        except Exception:
+            username = "(unknown)"
+        w(f"| Field | Value |\n|---|---|\n")
+        w(f"| Hostname | `{hostname}` |\n")
+        w(f"| User | `{username}` (uid={os.getuid()}, euid={os.geteuid()}) |\n")
+        w(f"| Python | `{sys.version.split()[0]}` |\n")
+        w(f"| Platform | `{platform.platform()}` |\n")
+        w(f"| CWD | `{Path.cwd()}` |\n")
+        w(f"| Invocation | `{' '.join(sys.argv)}` |\n\n")
+
+        # ── 3. Evidence source ────────────────────────────────────────────────
+        self._progress("Hashing evidence source files…")
+        w("## Evidence Source\n\n")
+        w(f"Docker root: `{self.docker.root.resolve()}`\n\n")
+        w(f"| Path | Present | Entries/Size | SHA-256 (files only) | mtime |\n")
+        w(f"|---|---|---|---|---|\n")
+        checks = [
+            self.docker.overlay2,
+            self.docker.image_db / "imagedb",
+            self.docker.image_db / "layerdb",
+            self.docker.image_db / "repositories.json",
+            self.docker.containers,
+        ]
+        for cp in checks:
+            rel = cp.relative_to(self.docker.root) if cp.is_relative_to(self.docker.root) else cp
+            exists = cp.exists()
+            if not exists:
+                w(f"| `{rel}` | NO | — | — | — |\n")
+                continue
+            if cp.is_file():
+                st = cp.stat()
+                sha = _file_sha256(cp)
+                mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")
+                w(f"| `{rel}` | yes | {fmt_size(st.st_size)} | `{sha}` | `{mtime}` |\n")
+            else:
+                try:
+                    n = sum(1 for _ in cp.iterdir())
+                except OSError:
+                    n = "?"
+                w(f"| `{rel}` | yes | {n} entries | — | — |\n")
+        w("\n")
+
+        # ── 4. Image inventory ────────────────────────────────────────────────
+        self._progress("Collecting images…")
+        images = self.docker.images()
+        w(f"## Images ({len(images)})\n\n")
+        if images:
+            w("| Short ID | Tags | Created | OS/Arch | Docker Ver | Layers | Size | Config SHA-256 |\n")
+            w("|---|---|---|---|---|---|---|---|\n")
+            for img in images:
+                cfg   = img["config"]
+                sid   = short(img["id"])
+                tags  = ", ".join(img.get("tags", [])) or "(untagged)"
+                ctime = cfg.get("created", "")
+                osarch = f"{cfg.get('os','?')}/{cfg.get('architecture','?')}"
+                dver  = cfg.get("docker_version", "?")
+                nlyr  = len(cfg.get("rootfs", {}).get("diff_ids", []))
+                # total size of all layers
+                try:
+                    cids = self.docker.image_cache_ids(img["id"])
+                    total_size = sum(
+                        _dir_size(self.docker.overlay2 / cid / "diff")
+                        for cid in cids if cid and (self.docker.overlay2 / cid / "diff").exists()
+                    )
+                except Exception:
+                    total_size = 0
+                # config file hash
+                cfg_path = (self.docker.image_db / "imagedb" / "content" / "sha256" / img["id"])
+                cfg_sha  = _file_sha256(cfg_path) if cfg_path.exists() else ""
+                w(f"| `{sid}` | {tags} | `{ctime}` | {osarch} | {dver} | {nlyr}"
+                  f" | {fmt_size(total_size)} | `{cfg_sha[:16]}…` |\n")
+            w("\n")
+
+            for img in images:
+                self._progress(f"Detailing image {short(img['id'])}…")
+                self._write_image_detail(buf, img)
+        else:
+            w("_(no images found)_\n\n")
+
+        # ── 5. Container inventory ────────────────────────────────────────────
+        self._progress("Collecting containers…")
+        containers = self.docker.containers_list()
+        w(f"## Containers ({len(containers)})\n\n")
+        if containers:
+            w("| Short ID | Name | Image | State | Created | Started | Finished |\n")
+            w("|---|---|---|---|---|---|---|\n")
+            for c in containers:
+                cfg  = c["config"]
+                st   = cfg.get("State", {})
+                sid  = short(c["id"])
+                name = cfg.get("Name", "").lstrip("/") or "(unnamed)"
+                img  = c.get("image_name") or short(cfg.get("Image", "").removeprefix("sha256:"), 12)
+                state = st.get("Status", "?")
+                ctime = cfg.get("Created", "")
+                start = st.get("StartedAt", "")
+                fin   = st.get("FinishedAt", "")
+                if fin == "0001-01-01T00:00:00Z":
+                    fin = ""
+                w(f"| `{sid}` | {name} | {img} | {state} | `{ctime}` | `{start}` | `{fin}` |\n")
+            w("\n")
+
+            for c in containers:
+                self._progress(f"Detailing container {short(c['id'])}…")
+                self._write_container_detail(buf, c)
+        else:
+            w("_(no containers found)_\n\n")
+
+        # ── 6. Warnings ───────────────────────────────────────────────────────
+        all_warnings = self.docker.warnings[:]
+        w("## Warnings\n\n")
+        if all_warnings:
+            for warn in all_warnings:
+                w(f"- {warn}\n")
+        else:
+            w("_(none)_\n")
+        w("\n")
+
+        body = buf.getvalue()
+        digest = hashlib.sha256(body.encode()).hexdigest()
+        body += "---\n\n"
+        body += f"**Report body SHA-256:** `{digest}`  \n"
+        body += "_(Strip this line and re-hash to verify integrity.)_\n"
+        return body
+
+    def _write_image_detail(self, buf: io.StringIO, img: dict):
+        w = buf.write
+        cfg  = img["config"]
+        sid  = short(img["id"])
+        tags = ", ".join(img.get("tags", [])) or "(untagged)"
+        w(f"### Image `{sid}` — {tags}\n\n")
+        w(f"- Full ID: `sha256:{img['id']}`\n")
+        w(f"- Created: `{cfg.get('created', '')}`\n")
+        history = cfg.get("history", [])
+        if history:
+            w(f"\n**Build history ({len(history)} steps):**\n\n")
+            for i, h in enumerate(history):
+                cb = h.get("created_by", "")[:100]
+                empty = " _(empty layer)_" if h.get("empty_layer") else ""
+                w(f"  {i}. `{cb}`{empty}\n")
+        w("\n**Layers:**\n\n")
+        w("| # | Diff ID (short) | Cache ID | On disk | Size |")
+        if self.hash_layers:
+            w(" Tree SHA-256 |")
+        w("\n|---|---|---|---|---|")
+        if self.hash_layers:
+            w("---|")
+        w("\n")
+        try:
+            diff_ids  = cfg.get("rootfs", {}).get("diff_ids", [])
+            cache_ids = self.docker.image_cache_ids(img["id"])
+            for i, (did, cid) in enumerate(zip(diff_ids, cache_ids)):
+                diff_dir = self.docker.overlay2 / cid / "diff" if cid else None
+                on_disk  = bool(diff_dir and diff_dir.exists())
+                size     = fmt_size(_dir_size(diff_dir)) if on_disk and diff_dir else "—"
+                did_s    = short(did.removeprefix("sha256:"), 16)
+                cid_s    = short(cid or "?", 16)
+                w(f"| {i} | `{did_s}` | `{cid_s}` | {'yes' if on_disk else 'NO'} | {size} |")
+                if self.hash_layers:
+                    tree_h = _tree_sha256(diff_dir) if on_disk and diff_dir else "—"
+                    w(f" `{tree_h[:16]}…` |")
+                w("\n")
+        except Exception as exc:
+            msg = f"[!] layer detail failed for {sid}: {exc}"
+            self.docker.warnings.append(msg)
+            w(f"\n_{msg}_\n")
+        w("\n")
+
+    def _write_container_detail(self, buf: io.StringIO, c: dict):
+        w = buf.write
+        cfg  = c["config"]
+        st   = cfg.get("State", {})
+        hcfg = cfg.get("HostConfig") or {}
+        sid  = short(c["id"])
+        name = cfg.get("Name", "").lstrip("/") or "(unnamed)"
+        w(f"### Container `{sid}` — {name}\n\n")
+        w(f"- Full ID: `{c['id']}`\n")
+        w(f"- Image: {c.get('image_name') or cfg.get('Image', '')}\n")
+        w(f"- State: {st.get('Status', '?')} (exit code {st.get('ExitCode', '?')})\n")
+
+        # config file hash
+        cfg_path = self.docker.containers / c["id"] / "config.v2.json"
+        cfg_sha  = _file_sha256(cfg_path) if cfg_path.exists() else ""
+        if cfg_sha:
+            w(f"- Config SHA-256: `{cfg_sha}`\n")
+
+        # upper layer
+        upper_id = self.docker.container_upper_id(c["id"])
+        if upper_id:
+            diff = self.docker.overlay2 / upper_id / "diff"
+            on_disk = diff.exists()
+            w(f"\n**Writable upper layer:** `{upper_id}`")
+            if on_disk:
+                sz = fmt_size(_dir_size(diff))
+                fc = _count_files(diff)
+                w(f"  ({sz}, {fc} files)")
+                if self.hash_layers:
+                    w(f"  tree SHA-256: `{_tree_sha256(diff)}`")
+            else:
+                w("  _(not on disk)_")
+            w("\n")
+
+            # diff summary
+            if on_disk:
+                try:
+                    image_id = cfg.get("Image", "").removeprefix("sha256:")
+                    img_cache = self.docker.image_cache_ids(image_id) if image_id else []
+                    init_id   = self.docker.container_init_id(c["id"])
+                    lower_ids = img_cache + ([init_id] if init_id else [])
+                    img_paths = _build_path_set(self.docker, lower_ids)
+                    changes   = _collect_diff(diff, img_paths)
+                    added   = sum(1 for ch in changes if ch["change"] == "A")
+                    modf    = sum(1 for ch in changes if ch["change"] == "M")
+                    deld    = sum(1 for ch in changes if ch["change"] == "D")
+                    w(f"\n**Filesystem diff:** {added} added, {modf} modified, {deld} deleted\n\n")
+                    if changes:
+                        w("| Change | Type | Path | Size | Note |\n|---|---|---|---|---|\n")
+                        for ch in changes[:200]:
+                            size_s = fmt_size(ch["size_bytes"]) if ch.get("size_bytes") else "—"
+                            note   = ch.get("note", "")
+                            w(f"| {ch['change']} | {ch['type']} | `{ch['path']}` | {size_s} | {note} |\n")
+                        if len(changes) > 200:
+                            w(f"\n_…{len(changes) - 200} more entries omitted_\n")
+                        w("\n")
+                except Exception as exc:
+                    msg = f"[!] diff failed for {sid}: {exc}"
+                    self.docker.warnings.append(msg)
+                    w(f"\n_{msg}_\n")
+
+        # log file
+        log_path = self.docker.container_log_path(c["id"])
+        if log_path:
+            log_sha  = _file_sha256(log_path)
+            log_size = log_path.stat().st_size
+            w(f"\n**Log file:** `{log_path}`  \n")
+            w(f"Size: {fmt_size(log_size)}  SHA-256: `{log_sha}`  \n")
+            # count lines / errors
+            lines_ok = 0
+            errors   = 0
+            try:
+                with open(log_path, "r", errors="replace") as fh:
+                    for raw in fh:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            json.loads(raw)
+                            lines_ok += 1
+                        except json.JSONDecodeError:
+                            errors += 1
+            except OSError:
+                pass
+            w(f"Lines: {lines_ok}")
+            if errors:
+                msg = f"log parse errors in {sid}: {errors} non-JSON line(s)"
+                self.docker.warnings.append(msg)
+                w(f"  _(parse errors: {errors})_")
+            w("\n\n")
+        else:
+            driver = hcfg.get("LogConfig", {}).get("Type", "")
+            if driver and driver != "json-file":
+                w(f"\n**Log:** no file found (log driver: `{driver}`)\n\n")
+            else:
+                w(f"\n**Log:** no file found\n\n")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI commands
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1033,7 +1412,9 @@ def cmd_log(args, docker: DockerRoot):
     log_path = docker.container_log_path(c["id"])
 
     if not log_path:
-        print(f"No log file found for container {short(c['id'])}", file=sys.stderr)
+        driver = (c["config"].get("HostConfig") or {}).get("LogConfig", {}).get("Type", "")
+        driver_note = f"  (log driver: {driver})" if driver and driver != "json-file" else ""
+        print(f"No log file found for container {short(c['id'])}{driver_note}", file=sys.stderr)
         sys.exit(1)
 
     stdout_only = args.stdout
@@ -1090,10 +1471,14 @@ def cmd_extract(args, docker: DockerRoot):
     output    = Path(args.output)
     verbose   = args.verbose
 
-    if output.exists() and any(output.iterdir()):
-        print(f"Error: output directory '{output}' exists and is not empty.", file=sys.stderr)
-        print("       Remove it first or choose a different path.", file=sys.stderr)
-        sys.exit(1)
+    if output.exists():
+        if not output.is_dir():
+            print(f"Error: output path '{output}' exists and is not a directory.", file=sys.stderr)
+            sys.exit(1)
+        if any(output.iterdir()):
+            print(f"Error: output directory '{output}' exists and is not empty.", file=sys.stderr)
+            print("       Remove it first or choose a different path.", file=sys.stderr)
+            sys.exit(1)
 
     merger = OverlayMerger(docker, verbose=verbose)
 
@@ -1125,6 +1510,24 @@ def cmd_extract(args, docker: DockerRoot):
         merger.merge(cache_ids, output)
 
 
+def cmd_report(args, docker: DockerRoot):
+    output_path = Path(args.output) if args.output else None
+
+    def progress(msg: str):
+        if not output_path or args.output == "-":
+            return
+        print(f"  {msg}", file=sys.stderr)
+
+    builder = ReportBuilder(docker, hash_layers=args.hash_layers, progress_cb=progress)
+    report  = builder.build()
+
+    if output_path and str(output_path) != "-":
+        output_path.write_text(report, encoding="utf-8")
+        print(f"Report written to: {output_path}", file=sys.stderr)
+    else:
+        sys.stdout.write(report)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1136,8 +1539,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("docker_root", metavar="<docker-root>",
                    help="Path to the Docker data directory (e.g. /mnt/evidence/var/lib/docker)")
+    p.add_argument("--tui", action="store_true",
+                   help="Launch interactive TUI (no subcommand required)")
 
-    sub = p.add_subparsers(dest="command", required=True)
+    sub = p.add_subparsers(dest="command", required=False)
 
     # list
     lst = sub.add_parser("list", help="List all images and containers")
@@ -1178,6 +1583,14 @@ def build_parser() -> argparse.ArgumentParser:
     ext.add_argument("-v", "--verbose", action="store_true",
                      help="Print each layer as it is applied")
 
+    # report
+    rep = sub.add_parser("report",
+                         help="Generate a self-contained forensic Markdown report")
+    rep.add_argument("-o", "--output", metavar="PATH", default=None,
+                     help="Write report to PATH instead of stdout (use '-' for stdout)")
+    rep.add_argument("--hash-layers", action="store_true",
+                     help="Hash every overlay2 diff tree (slow on large evidence)")
+
     return p
 
 
@@ -1190,6 +1603,15 @@ def main():
         print(f"Error: path does not exist: {docker.root}", file=sys.stderr)
         sys.exit(1)
 
+    if args.tui:
+        from docker_tui import run_tui
+        run_tui(docker)
+        return
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
     dispatch = {
         "list"   : cmd_list,
         "inspect": cmd_inspect,
@@ -1197,8 +1619,13 @@ def main():
         "diff"   : cmd_diff,
         "log"    : cmd_log,
         "extract": cmd_extract,
+        "report" : cmd_report,
     }
-    dispatch[args.command](args, docker)
+    try:
+        dispatch[args.command](args, docker)
+    except KeyboardInterrupt:
+        print("\n[aborted]", file=sys.stderr)
+        sys.exit(130)
 
 
 if __name__ == "__main__":

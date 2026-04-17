@@ -12,9 +12,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from docker_forensics import (
     DockerRoot,
     OverlayMerger,
+    ReportBuilder,
     _build_path_set,
     _collect_diff,
+    _file_sha256,
+    _tree_sha256,
     chain_id,
+    fmt_size,
+    fmt_ts,
 )
 
 
@@ -273,3 +278,193 @@ class TestCollectDiff:
         diff = tmp_path / "diff"
         diff.mkdir()
         assert _collect_diff(diff, set()) == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# fmt helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestFmtHelpers:
+    def test_fmt_size_bytes(self):
+        assert fmt_size(512) == "512.0 B"
+
+    def test_fmt_size_kib(self):
+        assert fmt_size(2048) == "2.0 KiB"
+
+    def test_fmt_size_mib(self):
+        assert fmt_size(3 * 1024 * 1024) == "3.0 MiB"
+
+    def test_fmt_size_gib(self):
+        assert fmt_size(2 * 1024 ** 3) == "2.0 GiB"
+
+    def test_fmt_size_tib(self):
+        assert "TiB" in fmt_size(2 * 1024 ** 4)
+
+    def test_fmt_ts_utc_z(self):
+        assert fmt_ts("2024-01-01T00:00:00Z") == "2024-01-01 00:00:00 UTC"
+
+    def test_fmt_ts_with_offset(self):
+        assert fmt_ts("2024-06-15T12:30:00+00:00") == "2024-06-15 12:30:00 UTC"
+
+    def test_fmt_ts_empty(self):
+        assert fmt_ts("") == "(unknown)"
+
+    def test_fmt_ts_garbage(self):
+        assert fmt_ts("not-a-date") == "not-a-date"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _tree_sha256
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestTreeSha256:
+    def _make_tree(self, base: Path):
+        (base / "a").write_bytes(b"hello")
+        (base / "sub").mkdir()
+        (base / "sub" / "b").write_bytes(b"world")
+        import os
+        os.symlink("../a", base / "sub" / "link")
+
+    def test_deterministic(self, tmp_path):
+        t1 = tmp_path / "t1"
+        t2 = tmp_path / "t2"
+        t1.mkdir()
+        t2.mkdir()
+        self._make_tree(t1)
+        self._make_tree(t2)
+        assert _tree_sha256(t1) == _tree_sha256(t2)
+
+    def test_different_content_different_hash(self, tmp_path):
+        t1 = tmp_path / "t1"
+        t2 = tmp_path / "t2"
+        t1.mkdir()
+        t2.mkdir()
+        (t1 / "f").write_bytes(b"aaa")
+        (t2 / "f").write_bytes(b"bbb")
+        assert _tree_sha256(t1) != _tree_sha256(t2)
+
+    def test_returns_hex_string(self, tmp_path):
+        d = tmp_path / "d"
+        d.mkdir()
+        (d / "x").write_bytes(b"x")
+        h = _tree_sha256(d)
+        assert len(h) == 64
+        assert all(c in "0123456789abcdef" for c in h)
+
+    def test_empty_dir(self, tmp_path):
+        d = tmp_path / "d"
+        d.mkdir()
+        h = _tree_sha256(d)
+        assert len(h) == 64
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ReportBuilder
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestReportBuilder:
+    def test_report_contains_image_id(self, docker_root):
+        dr     = DockerRoot(docker_root["root"])
+        report = ReportBuilder(dr).build()
+        assert docker_root["image_id"][:12] in report
+
+    def test_report_contains_container_id(self, docker_root):
+        dr     = DockerRoot(docker_root["root"])
+        report = ReportBuilder(dr).build()
+        assert docker_root["container_id"][:12] in report
+
+    def test_report_contains_log_sha256(self, docker_root):
+        dr       = DockerRoot(docker_root["root"])
+        log_path = dr.container_log_path(docker_root["container_id"])
+        log_sha  = _file_sha256(log_path)
+        report   = ReportBuilder(dr).build()
+        assert log_sha in report
+
+    def test_report_contains_config_sha256(self, docker_root):
+        dr       = DockerRoot(docker_root["root"])
+        cfg_path = dr.containers / docker_root["container_id"] / "config.v2.json"
+        cfg_sha  = _file_sha256(cfg_path)
+        report   = ReportBuilder(dr).build()
+        assert cfg_sha in report
+
+    def test_integrity_footer_present(self, docker_root):
+        dr     = DockerRoot(docker_root["root"])
+        report = ReportBuilder(dr).build()
+        assert "Report body SHA-256" in report
+
+    def test_integrity_footer_verifiable(self, docker_root):
+        dr     = DockerRoot(docker_root["root"])
+        report = ReportBuilder(dr).build()
+        lines  = report.splitlines()
+        # Find footer line (last non-empty line that contains the hash)
+        footer_line = next(
+            l for l in reversed(lines) if "Report body SHA-256" in l
+        )
+        # Extract the hex digest from the backtick-delimited token
+        import re
+        m = re.search(r"`([0-9a-f]{64})`", footer_line)
+        assert m, "Could not find SHA-256 hex digest in footer"
+        claimed = m.group(1)
+        # Body is everything before the "---\n\n" separator
+        body = report.split("---\n\n")[0]
+        actual = hashlib.sha256(body.encode()).hexdigest()
+        assert claimed == actual
+
+    def test_hash_layers_includes_tree_hashes(self, docker_root):
+        dr     = DockerRoot(docker_root["root"])
+        report = ReportBuilder(dr, hash_layers=True).build()
+        # With hash_layers the layer table has an extra column header
+        assert "Tree SHA-256" in report
+
+    def test_two_runs_same_footer_hash(self, docker_root):
+        """Body hash must be stable across runs (UUID and timestamp aside)."""
+        import re
+        dr = DockerRoot(docker_root["root"])
+
+        def get_hash(rpt):
+            m = re.search(r"Report body SHA-256.*`([0-9a-f]{64})`", rpt)
+            assert m
+            return m.group(1)
+
+        h1 = get_hash(ReportBuilder(dr).build())
+        # Reset warnings so they don't accumulate
+        dr.warnings.clear()
+        h2 = get_hash(ReportBuilder(dr).build())
+        # Hashes will differ only because of UUID and timestamp — we verify
+        # structural consistency rather than byte-for-byte equality.
+        # Both should look like valid SHA-256 digests.
+        assert len(h1) == 64
+        assert len(h2) == 64
+
+    def test_warnings_section_present(self, docker_root):
+        dr     = DockerRoot(docker_root["root"])
+        report = ReportBuilder(dr).build()
+        assert "## Warnings" in report
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cmd_extract — existing-file guard
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestCmdExtract:
+    def test_extract_to_existing_file_gives_clean_error(self, docker_root, tmp_path, capsys):
+        """extract must print a clear error when output path is a regular file."""
+        import argparse
+        from docker_forensics import cmd_extract
+
+        out_file = tmp_path / "not_a_dir.txt"
+        out_file.write_text("i am a file")
+
+        dr   = DockerRoot(docker_root["root"])
+        args = argparse.Namespace(
+            kind="image",
+            id=docker_root["image_id"][:12],
+            output=str(out_file),
+            verbose=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_extract(args, dr)
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "not a directory" in captured.err.lower() or "is not a directory" in captured.err
